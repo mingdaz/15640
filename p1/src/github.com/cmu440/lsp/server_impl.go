@@ -1,13 +1,9 @@
-// Contains the implementation of a LSP server.
-// @author: Chun Chen
-
 package lsp
 
 import (
 	"container/list"
 	"encoding/json"
 	"errors"
-	// "fmt"
 	"github.com/cmu440/lspnet"
 	"strconv"
 	"time"
@@ -96,13 +92,13 @@ func NewServer(port int, params *Params) (Server, error) {
 			case ReqEpoch:
 				Server.handleEpoch()
 			case ReqRead:
-				Server.handleRead(req)
+				Server.myRead(req)
 			case ReqWrite:
-				Server.handleWrite(req)
+				Server.myWrite(req)
 			case ReqCloseConn:
-				Server.handleCloseConn(req)
+				Server.myCloseConn(req)
 			case ReqClose:
-				Server.handleClose(req)
+				Server.myClose(req)
 			}
 		}
 	}()
@@ -122,44 +118,39 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) Read() (int, []byte, error) {
-	retVal, err := s.doRequest(ReqRead, nil)
-	bundle := retVal.(*IdPayload)
-	return bundle.connId, bundle.payload, err
+	v, err := s.handleRequest(ReqRead, nil)
+	p := v.(*IdPayload)
+	return p.connId, p.payload, err
 }
 
 func (s *server) Write(connID int, payload []byte) error {
-	bundle := &IdPayload{connID, payload}
-	_, err := s.doRequest(ReqWrite, bundle)
+	p := &IdPayload{connID, payload}
+	_, err := s.handleRequest(ReqWrite, p)
 	return err
 }
 
 func (s *server) CloseConn(connID int) error {
-	_, err := s.doRequest(ReqCloseConn, connID)
+	_, err := s.handleRequest(ReqCloseConn, connID)
 	return err
 }
 
 func (s *server) Close() error {
-	_, err := s.doRequest(ReqClose, nil)
+	_, err := s.handleRequest(ReqClose, nil)
 	return err
 }
 
-// submit the request to reqeust channel (requestChannel). waiting for the event handler to handle
-func (s *server) doRequest(op ReqType, val interface{}) (interface{}, error) {
-	req := &request{op, val, make(chan *autoret)}
+func (s *server) handleRequest(r ReqType, val interface{}) (interface{}, error) {
+	req := &request{r, val, make(chan *autoret)}
 	s.requestChannel <- req
-	retVal := <-req.ReplyChannel
-	return retVal.Value, retVal.Err
+	v := <-req.ReplyChannel
+	return v.Value, v.Err
 }
 
-// do corresponding actions when a new message comes from network handler
 func (s *server) handleReceivedMsg(req *request) {
 	clientAddr := req.Value.(*Packet).raddr
 	receivedMsg := req.Value.(*Packet).msg
-	// fmt.Println(receivedMsg.String())
 	switch receivedMsg.Type {
 	case MsgConnect:
-		// if the hostport was never seen, or the connection is lost/closed, and the server is not closed,
-		// establish a connection and initiate related resources
 		if connId := s.hostportConnIdMap[clientAddr.String()]; s.delayClose.Len() == 0 && connId == 0 {
 			s.connId += 1
 			s.hostportConnIdMap[clientAddr.String()] = s.connId
@@ -177,18 +168,12 @@ func (s *server) handleReceivedMsg(req *request) {
 			s.activeConn[s.connId] = true
 		}
 	case MsgAck:
-		// if the connection with this client is established before, and not lost
 		if clientConnId := s.hostportConnIdMap[clientAddr.String()]; clientConnId > 0 {
-			// set the latest active epoch of the specified connection
 			s.latestActiveEpoch[clientConnId] = s.currEpoch
-
 			unackmsgBuffer := s.unackmsgBuffer[clientConnId]
-			msgExist := unackmsgBuffer.Delete(receivedMsg.SeqNum)
-
-			// move messages from write MsgBuffer to unAckedMsg MsgBuffer and send them out via network
-			// if their seq nums are in the sliding window
+			haveMsg := unackmsgBuffer.Delete(receivedMsg.SeqNum)
 			writeBuffer := s.writeBuffer[clientConnId]
-			if msgExist && writeBuffer.Length() > 0 {
+			if haveMsg && writeBuffer.Length() > 0 {
 				if unackmsgBuffer.Length() == 0 {
 					sentMsg := writeBuffer.Pop()
 					buf, _ := json.Marshal(sentMsg)
@@ -209,10 +194,7 @@ func (s *server) handleReceivedMsg(req *request) {
 					}
 				}
 			}
-
-			// if the connection is closed/the server is closed and all pending messages are sent and acked,
-			// clean up all resources that relates to the connection
-			if msgExist && unackmsgBuffer.Length() == 0 && (!s.activeConn[clientConnId] || s.delayClose.Len() > 0) {
+			if haveMsg && unackmsgBuffer.Length() == 0 && (!s.activeConn[clientConnId] || s.delayClose.Len() > 0) {
 				delete(s.hostportConnIdMap, clientAddr.String())
 				delete(s.connIdHostportMap, clientConnId)
 				delete(s.readBuffer, clientConnId)
@@ -225,65 +207,45 @@ func (s *server) handleReceivedMsg(req *request) {
 			}
 		}
 	case MsgData:
-		// don't receive data message if the connection is closed/lost or the server is closed
 		if clientConnId := s.hostportConnIdMap[clientAddr.String()]; clientConnId > 0 && s.activeConn[clientConnId] && s.delayClose.Len() == 0 {
-			// set the latest active epoch of the specified connection
 			s.latestActiveEpoch[clientConnId] = s.currEpoch
-
 			readBuffer := s.readBuffer[clientConnId]
-
-			// ignore data messages whose seq num is smaller than the expected seq num
-			// epoch handler will resend the acks that haven't been received on the other side (if their seq num is smaller than expected seq num)
-			// and the same size of sliding window on both sending and receiving side guarantee the correctness, otherwise we may have to send ack
-			// for every data message we receive no matter whether its seq num is larger or smaller than the expected seq num
 			if receivedMsg.SeqNum >= s.waitSeqNum[clientConnId] {
 				readBuffer.Insert(receivedMsg)
-				// send ack for the data message and put the ack into latestAck MsgBuffer
 				sendackBuffer := s.sendackBuffer[clientConnId]
 				ackMsg := NewAck(clientConnId, receivedMsg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
 				s.sconn.WriteToUDP(buf, clientAddr)
-
 				sendackBuffer.Insert(ackMsg)
-				// adjust the MsgBuffer to conform sliding window size
 				sendackBuffer.Fitwindow(s.params.WindowSize)
-				// fmt.Printf("%d\n", sendackBuffer.Length())
-				// wake a deferred read reqeusts up if the seq num of incoming message equals the expected seq num of the connection
 				if receivedMsg.SeqNum == s.waitSeqNum[clientConnId] && s.delayRead.Len() > 0 {
 					readReq := s.delayRead.Front().Value.(*request)
 					s.delayRead.Remove(s.delayRead.Front())
-					s.handleRead(readReq)
+					s.myRead(readReq)
 				}
 			}
 		}
 	}
 }
 
-// do corresponding actions when epoch fires
 func (s *server) handleEpoch() {
 	s.currEpoch += 1
 
-	// detect connection lost
 	for connId, latestActiveEpoch := range s.latestActiveEpoch {
 		if s.currEpoch-latestActiveEpoch >= s.params.EpochLimit {
 			if s.delayClose.Len() > 0 {
 				s.connLostInClosing = true
 			}
 			delete(s.activeConn, connId)
-			// wake one deferred read up if no message is ready in read MsgBuffer of the connection
-			// if condition is matched, then clean up all realted resources of the connection including the read MsgBuffer and expected seq num
-			// otherwise clean up all related resources except read MsgBuffer and expected seq num since we allow further Read on a lost connection
 			if (s.readBuffer[connId].Length() == 0 || s.readBuffer[connId].Front().SeqNum != s.waitSeqNum[connId]) &&
 				s.delayRead.Len() > 0 {
-				// since the connection has nothing to read and unblocks a deferred read, clean up its readMsgBuffer and waitSeqNum
 				delete(s.readBuffer, connId)
 				delete(s.waitSeqNum, connId)
 				readReq := s.delayRead.Front().Value.(*request)
 				s.delayRead.Remove(s.delayRead.Front())
-				retVal := &autoret{&IdPayload{connId, nil}, errors.New("s1")}
-				readReq.ReplyChannel <- retVal
+				v := &autoret{&IdPayload{connId, nil}, errors.New("s1")}
+				readReq.ReplyChannel <- v
 			}
-			// clean up all remaining related resources of this connection
 			clientAddr := s.connIdHostportMap[connId]
 			delete(s.hostportConnIdMap, clientAddr.String())
 			delete(s.connIdHostportMap, connId)
@@ -295,12 +257,9 @@ func (s *server) handleEpoch() {
 		}
 	}
 
-	// don't resend latest ack if the server is closed
 	if s.delayClose.Len() == 0 {
 		for connId, sendackBuffer := range s.sendackBuffer {
-			// if the connection is not closed
 			if s.activeConn[connId] {
-				// if the connection hasn't received any data message after connection is established, send a ack with seq num 0
 				if sendackBuffer.Length() == 0 {
 					ackMsg := NewAck(connId, 0)
 					clientAddr := s.connIdHostportMap[connId]
@@ -318,7 +277,6 @@ func (s *server) handleEpoch() {
 		}
 	}
 
-	// resend sent but unacked data messages, even though the connection is closed or the server is closed
 	nonEmptyBuffer := 0
 	for connId, unackmsgBuffer := range s.unackmsgBuffer {
 		if unackmsgBuffer.Length() > 0 || s.writeBuffer[connId].Length() > 0 {
@@ -333,65 +291,54 @@ func (s *server) handleEpoch() {
 		}
 	}
 
-	// if there is deferred Close() request and all pending messages are sent and acked, wake the pending Close request up
 	if s.delayClose.Len() > 0 && nonEmptyBuffer == 0 {
 		for e := s.delayClose.Front(); e != nil; e = e.Next() {
 			closeReq := e.Value.(*request)
-			var retVal *autoret
+			var v *autoret
 			if s.connLostInClosing {
-				retVal = &autoret{nil, errors.New("s2")}
+				v = &autoret{nil, errors.New("s2")}
 			} else {
-				retVal = &autoret{nil, nil}
+				v = &autoret{nil, nil}
 			}
-			closeReq.ReplyChannel <- retVal
+			closeReq.ReplyChannel <- v
 		}
-		// stop the main handler routine
 		s.serverRunning = false
 		s.shutDown()
 	}
 }
 
-// handle user read request
-func (s *server) handleRead(req *request) {
-	// return an error if the server is closed
+func (s *server) myRead(req *request) {
 	if s.delayClose.Len() > 0 {
 		req.ReplyChannel <- &autoret{nil, errors.New("s3")}
 		return
 	}
 
-	// check if there is any data message ready for read in any read MsgBuffer
 	for connId, readBuffer := range s.readBuffer {
 		if readBuffer.Length() > 0 && readBuffer.Front().SeqNum == s.waitSeqNum[connId] {
 			readMsg := readBuffer.Pop()
 			s.waitSeqNum[connId] += 1
-			retVal := &autoret{&IdPayload{connId, readMsg.Payload}, nil}
-			req.ReplyChannel <- retVal
+			v := &autoret{&IdPayload{connId, readMsg.Payload}, nil}
+			req.ReplyChannel <- v
 			return
 		}
 	}
 
-	// if nothing can be read from any read MsgBuffer, check if there is any lost connection in them
 	for connId, _ := range s.readBuffer {
-		// if the connection is lost and has no data message for reading
 		if !s.activeConn[connId] {
-			retVal := &autoret{&IdPayload{connId, nil}, errors.New("s4")}
-			req.ReplyChannel <- retVal
-			// clean up the realted resource of the lost connection
+			v := &autoret{&IdPayload{connId, nil}, errors.New("s4")}
+			req.ReplyChannel <- v
 			delete(s.readBuffer, connId)
 			delete(s.waitSeqNum, connId)
 			return
 		}
 	}
 
-	// if nothing can be read from any read MsgBuffer and no lost connection with no data ready for reading, defer the Read
 	s.delayRead.PushBack(req)
 }
 
-// handle user write request
-func (s *server) handleWrite(req *request) {
+func (s *server) myWrite(req *request) {
 	connId := req.Value.(*IdPayload).connId
 	payload := req.Value.(*IdPayload).payload
-	// return an error if the connection is closed/lost, or the server is closed
 	if s.delayClose.Len() > 0 || !s.activeConn[connId] {
 		req.ReplyChannel <- &autoret{nil, errors.New("s5")}
 	} else {
@@ -418,34 +365,27 @@ func (s *server) handleWrite(req *request) {
 	}
 }
 
-// handle user close a specified connection
-func (s *server) handleCloseConn(req *request) {
+func (s *server) myCloseConn(req *request) {
 	connId := req.Value.(int)
-	// if the connection is not closed or lost
 	if s.activeConn[connId] {
-		// unblock one delay read
 		if s.delayRead.Len() > 0 {
 			readReq := s.delayClose.Front().Value.(*request)
 			s.delayRead.Remove(s.delayRead.Front())
-			retVal := &autoret{&IdPayload{connId, nil}, errors.New("s7")}
-			readReq.ReplyChannel <- retVal
+			v := &autoret{&IdPayload{connId, nil}, errors.New("s7")}
+			readReq.ReplyChannel <- v
 		}
-
 		clientAddr := s.connIdHostportMap[connId]
-		// if there is no pending messages to be resent and acked, clean up resources that are used for resending unAcked messages
 		if s.unackmsgBuffer[connId].Length() == 0 && s.writeBuffer[connId].Length() == 0 {
 			delete(s.writeBuffer, connId)
 			delete(s.unackmsgBuffer, connId)
 			delete(s.hostportConnIdMap, clientAddr.String())
 			delete(s.connIdHostportMap, connId)
 		}
-
 		delete(s.readBuffer, connId)
 		delete(s.sendackBuffer, connId)
 		delete(s.latestActiveEpoch, connId)
 		delete(s.waitSeqNum, connId)
 		delete(s.seqNum, connId)
-
 		delete(s.activeConn, connId)
 		req.ReplyChannel <- &autoret{nil, nil}
 	} else {
@@ -453,16 +393,13 @@ func (s *server) handleCloseConn(req *request) {
 	}
 }
 
-// handle user close the server
-func (s *server) handleClose(req *request) {
-	// unblcok all delay reads
+func (s *server) myClose(req *request) {
 	for s.delayRead.Len() != 0 {
 		readReq := s.delayClose.Front().Value.(*request)
 		s.delayRead.Remove(s.delayRead.Front())
-		retVal := &autoret{&IdPayload{0, nil}, errors.New("s9")}
-		readReq.ReplyChannel <- retVal
+		v := &autoret{&IdPayload{0, nil}, errors.New("s9")}
+		readReq.ReplyChannel <- v
 	}
-
 	nonEmptyBuffer := 0
 	for connId, unackmsgBuffer := range s.unackmsgBuffer {
 		if unackmsgBuffer.Length() > 0 || s.writeBuffer[connId].Length() > 0 {
@@ -470,24 +407,18 @@ func (s *server) handleClose(req *request) {
 			break
 		}
 	}
-	// if there is no sent but unacked messages, shut down the whole server immediately
 	if nonEmptyBuffer == 0 {
 		s.shutDown()
 		req.ReplyChannel <- &autoret{nil, nil}
 		s.serverRunning = false
 	} else {
-		// otherwise defer the Close request
 		s.delayClose.PushBack(req)
 	}
 }
 
-// shut down the network handler and epoch timer go routines
 func (s *server) shutDown() {
 	if s.sconn != nil {
 		s.sconn.Close()
 	}
 	s.connClose <- 1
 }
-
-// go routine which handles multiple requests (notification) from reqeust channel (requestChannel),
-// including reqeusts from user and notifications from epoch timer and network handler
