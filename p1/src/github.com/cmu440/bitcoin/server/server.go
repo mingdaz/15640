@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/cmu440/bitcoin"
 	"github.com/cmu440/lsp"
-	"log"
+	// "log"
 	"math"
 	"os"
 	"strconv"
@@ -55,7 +55,7 @@ func main() {
 	idleMiner := make(map[int]bool)
 	queue := list.New()
 
-	file, err := os.OpenFile(name, flag, perm)
+	// file, err := os.OpenFile(name, flag, perm)
 	if err != nil {
 		return
 	}
