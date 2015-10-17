@@ -32,9 +32,10 @@ func main() {
 
 	// TODO: implement this!
 	const thres = 10000
-	const name = "log.txt"
-	const flag = os.O_RDWR | os.O_CREATE
-	const perm = os.FileMode(0666)
+	// const name = "log.txt"
+	// const flag = os.O_RDWR | os.O_CREATE
+	// const perm = os.FileMode(0666)
+	// var FLOG *log.Logger
 
 	port, err := strconv.Atoi(os.Args[1])
 	if err != nil {
@@ -53,6 +54,13 @@ func main() {
 	workminers := make(map[int]*MinerJob)
 	idleMiner := make(map[int]bool)
 	queue := list.New()
+
+	file, err := os.OpenFile(name, flag, perm)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	// FLOG = log.New(file, "", log.Lshortfile|log.Lmicroseconds)
 
 	for {
 		// assign job to miner
@@ -84,6 +92,8 @@ func main() {
 		connId, data, err := Server.Read()
 		var msg *bitcoin.Message
 		if err != nil {
+			// FLOG.Println("handle failure: ", connId)
+
 			// handle failure
 			if job, ok := workminers[connId]; ok {
 				// miner client
@@ -105,6 +115,7 @@ func main() {
 				fmt.Println("Error unmarshal")
 				continue
 			}
+			// FLOG.Println("handle income message: ", msg)
 
 			switch msg.Type {
 			case bitcoin.Join:
@@ -153,6 +164,7 @@ func main() {
 					}
 				}
 			case bitcoin.Result:
+
 				//update result
 				clientconnid := workminers[connId].clientid
 				clist := clients[clientconnid]
@@ -169,6 +181,8 @@ func main() {
 						resultmsg := bitcoin.NewResult(clist.minHash, clist.nonce)
 						buf, err := json.Marshal(resultmsg)
 						if err == nil {
+							// FLOG.Println("send back result: ", resultmsg.Hash, resultmsg.Nonce)
+
 							Server.Write(clientconnid, buf)
 						}
 						delete(clients, clientconnid)
