@@ -56,10 +56,10 @@ func main() {
 	queue := list.New()
 
 	// file, err := os.OpenFile(name, flag, perm)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+	// if err != nil {
+	// 	return
+	// }
+	// defer file.Close()
 	// FLOG = log.New(file, "", log.Lshortfile|log.Lmicroseconds)
 
 	for {
